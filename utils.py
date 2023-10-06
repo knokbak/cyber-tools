@@ -169,7 +169,9 @@ def print_table(rows: list[list[str]]):
 
 # Request confirmation from the user before transmitting traffic over the network
 def confirm_network_transmit() -> bool:
-    return (input('I am about to send traffic over the network. Continue? [Y/n]: ').lower() or 'y') == 'y'
+    continuing = (input('\n\033[93m\033[1mI am about to send traffic over the network.\033[0m Continue? [Y/n]: ').lower() or 'y') == 'y'
+    print()
+    return continuing
 
 
 # Determines version of IP address
@@ -197,12 +199,11 @@ def get_interface_mac_address(interface: str) -> str:
 
 
 # Generate a random MAC address
-def generate_random_mac_address() -> str:
-    mac_address = []
-    for i in range(6):
-        byte = random.randint(0, 255)
-        mac_address.append(f'{byte:02x}')
-    mac_address[0] = mac_address[0][:-1] + '2'
+def generate_random_mac_address(interface: str) -> str:
+    my_mac_addr = get_interface_mac_address(interface).split(':')
+    mac_address = my_mac_addr[0:3]
+    for i in range(6 - len(mac_address)):
+        mac_address.append(f'{random.randint(0, 255):02x}')
     return ':'.join(mac_address)
 
 
@@ -226,3 +227,12 @@ def make_progress_bar(text: str, current: float, max: float) -> str:
             bar += '░'
     
     return f'{bar}  {text}'
+
+
+# Builds an Ethernet frame from header and data. Adds padding if required
+def build_eth_frame(header: bytes, data: bytes) -> bytes:
+    # length = len(header) + len(data)
+    # if length < 64:
+    #    for i in range(64 - length):
+    #        data += bytes(0x00)
+    return header + data

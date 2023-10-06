@@ -6,6 +6,8 @@
 # Utilities for knokbak/cyber-tools
 # OK - 27 Sep 2023
 
+from functools import partial
+from os import geteuid
 from utils import prompt_menu
 from module_arp import main as arp_main
 
@@ -22,8 +24,13 @@ Press Ctrl+C to exit from a mode.
 Press Ctrl+Z to quit the program.
     ''')
 
+    if geteuid() != 0:
+        raise Exception('This script must be run as root.')
+
+    interface = input('Enter an interface [eth0]: ').lower() or 'eth0'
+
     prompt_menu('Main Menu', [
-        ('ARP', arp_main),
+        ('ARP', partial(arp_main, interface)),
     ])
 
 

